@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
 import { db } from '../firebase';
-import { doc, onSnapshot, updateDoc, arrayUnion, setDoc } from 'firebase/firestore';
-import { GameState, Player } from '../types';
-import AdventureMap from './AdventureMap';
-import Leaderboard from './Leaderboard';
-import QuestionModal from './QuestionModal';
+import { doc, onSnapshot, runTransaction, arrayUnion, updateDoc } from 'firebase/firestore';
+import { GameState, Player, Question } from '../types';
 import { predefinedQuestions } from '../questions';
+import AdventureMap from './AdventureMap';
+import QuestionModal from './QuestionModal';
+import Leaderboard from './Leaderboard';
 
 interface GameProps {
   name: string;
@@ -14,83 +14,98 @@ interface GameProps {
 
 const Game: React.FC<GameProps> = ({ name, gameId }) => {
   const [gameState, setGameState] = useState<GameState | null>(null);
-  const [localPlayer, setLocalPlayer] = useState<Player | null>(null);
-  const [showQuestion, setShowQuestion] = useState(false);
-
-  const playerId = React.useMemo(() => `${name.replace(/\s+/g, '-')}-${Date.now()}`, [name]);
+  // Create a stable player ID for the duration of the component's life
+  const [localPlayerId] = useState(() => `${name.replace(/\s+/g, '-')}-${Date.now()}`);
+  const [activeQuestion, setActiveQuestion] = useState<Question | null>(null);
+  const [showModal, setShowModal] = useState(false);
 
   useEffect(() => {
     const gameRef = doc(db, 'games', gameId);
 
-    // Adiciona o jogador ao jogo no Firestore
     const joinGame = async () => {
-        const newPlayer: Player = { id: playerId, name, score: 0, currentPhase: 0 };
-        // Usamos set com merge para criar o documento se não existir
-        await setDoc(gameRef, { 
-            players: arrayUnion(newPlayer),
-            status: 'playing' 
-        }, { merge: true });
+      try {
+        await runTransaction(db, async (transaction) => {
+          const gameSnap = await transaction.get(gameRef);
+          
+          if (!gameSnap.exists()) {
+            // Game doesn't exist, create it with the current player
+            const newPlayer: Player = { id: localPlayerId, name, score: 0, currentPhase: 0 };
+            transaction.set(gameRef, { players: [newPlayer], status: 'playing' });
+          } else {
+            // Game exists, add player if not already in
+            const players = gameSnap.data().players as Player[];
+            if (!players.some(p => p.id === localPlayerId)) {
+                const newPlayer: Player = { id: localPlayerId, name, score: 0, currentPhase: 0 };
+                transaction.update(gameRef, { players: arrayUnion(newPlayer) });
+            }
+          }
+        });
+      } catch (e) {
+        console.error("Failed to join game:", e);
+      }
     };
+
     joinGame();
 
-    // Ouve as atualizações do estado do jogo
-    const unsubscribe = onSnapshot(gameRef, (snapshot) => {
-      if (snapshot.exists()) {
-        const data = snapshot.data() as GameState;
-        setGameState(data);
-        const currentPlayer = data.players.find(p => p.id === playerId);
-        if (currentPlayer) {
-            setLocalPlayer(currentPlayer);
-        }
+    const unsubscribe = onSnapshot(gameRef, (doc) => {
+      if (doc.exists()) {
+        setGameState(doc.data() as GameState);
       } else {
-        // O professor pode criar este documento
-        console.log("Jogo não encontrado, esperando o professor iniciar.");
+        console.log(`Game ${gameId} does not exist.`);
+        setGameState(null);
       }
     });
 
     return () => unsubscribe();
-  }, [gameId, name, playerId]);
+  }, [gameId, name, localPlayerId]);
 
   const handlePhaseClick = (phaseIndex: number) => {
-    if (localPlayer?.currentPhase === phaseIndex) {
-      setShowQuestion(true);
+    const localPlayer = gameState?.players.find(p => p.id === localPlayerId);
+    if (localPlayer && localPlayer.currentPhase === phaseIndex && gameState?.status === 'playing') {
+      setActiveQuestion(predefinedQuestions[phaseIndex]);
+      setShowModal(true);
     }
   };
-  
+
   const handleAnswer = async (isCorrect: boolean) => {
-    setShowQuestion(false);
+    setShowModal(false);
+    setActiveQuestion(null);
+
+    const localPlayer = gameState?.players.find(p => p.id === localPlayerId);
     if (!localPlayer || !gameState) return;
 
-    const gameRef = doc(db, 'games', gameId);
-    const updatedPlayers = gameState.players.map(p => {
-        if (p.id === playerId) {
-            const newScore = isCorrect ? p.score + 10 : p.score;
-            const newPhase = isCorrect ? p.currentPhase + 1 : p.currentPhase;
-            return { ...p, score: newScore, currentPhase: newPhase };
-        }
-        return p;
-    });
-
-    await updateDoc(gameRef, { players: updatedPlayers });
+    if (isCorrect) {
+      const updatedPlayers = gameState.players.map(p =>
+        p.id === localPlayerId
+          ? { ...p, score: p.score + 10, currentPhase: p.currentPhase + 1 }
+          : p
+      );
+      
+      const gameRef = doc(db, 'games', gameId);
+      await updateDoc(gameRef, { players: updatedPlayers });
+    }
   };
 
-
-  if (!gameState || !localPlayer) {
-    return <div className="flex items-center justify-center h-full">Carregando aventura...</div>;
+  if (!gameState || !gameState.players.some(p => p.id === localPlayerId)) {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <p className="text-2xl animate-pulse">Entrando na aventura...</p>
+      </div>
+    );
   }
 
   return (
-    <div className="relative h-full w-full">
-      <Leaderboard players={gameState.players} />
-      <AdventureMap 
-        players={gameState.players} 
-        onPhaseClick={handlePhaseClick} 
-        localPlayerId={playerId}
+    <div className="relative h-full w-full bg-slate-700">
+      <AdventureMap
+        players={gameState.players}
+        localPlayerId={localPlayerId}
+        onPhaseClick={handlePhaseClick}
       />
-      {showQuestion && (
-        <QuestionModal 
-            question={predefinedQuestions[localPlayer.currentPhase]}
-            onAnswer={handleAnswer}
+      <Leaderboard players={gameState.players} />
+      {showModal && activeQuestion && (
+        <QuestionModal
+          question={activeQuestion}
+          onAnswer={handleAnswer}
         />
       )}
     </div>
